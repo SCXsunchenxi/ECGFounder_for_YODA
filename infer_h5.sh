@@ -1,12 +1,14 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ECGFounder — single-lead inference on legacy Xy matrix H5 files
+# ECGFounder — inference on AFib case/control dataset
 #
-# Data format:  legacy Xy matrix (shape: n_channels × n_samples)
-# ECG channel:  ch13 (0-indexed), sampling rate 200 Hz
-# Model:        1-lead ECGFounder (in_channels=1)
-# Output:       results/<h5_stem>.csv  (one CSV per H5 file)
-#   columns: file, window_start_sec, window_end_sec, <150 class probabilities>
+# Input layout (produced by download_from_aws.py):
+#   afib_case_control_200_data/afib_positive/<age_group>/*.h5
+#   afib_case_control_200_data/afib_negative/<age_group>/*.h5
+#
+# Output layout (mirrors input structure):
+#   afib_case_control_200_results/afib_positive/<age_group>/<stem>.csv
+#   afib_case_control_200_results/afib_negative/<age_group>/<stem>.csv
 #
 # If the checkpoint is missing, download it from HuggingFace:
 #   pip install huggingface_hub
@@ -15,23 +17,19 @@
 #     local_dir='./checkpoint')"
 # ─────────────────────────────────────────────────────────────────────────────
 
-H5_DIR="/data/sleep/ECGFounder/S0001_500_age_stratified_data/"
+DATA_ROOT="/data/YODA/ECGFounder/afib_case_control_200_data"
+OUT_ROOT="/data/YODA/ECGFounder/afib_case_control_200_results"
 CKPT="./checkpoint/1_lead_ECGFounder.pth"
 TASKS="./tasks.txt"
-OUT="/data/sleep/ECGFounder/S0001_500_age_stratified_results/"           # output directory; one <stem>.csv per H5 file
 BATCH_SIZE=256
-
-# H5 files created by cohort_h5_conversion_reference.py store ECG under
-# /signals/ecg  (grouped format).  Use --leads to activate that mode.
 LEADS="ecg"
-
-WINDOW_SEC=10    # sliding-window length in seconds
-STRIDE_SEC=10    # stride between windows (= no overlap)
+WINDOW_SEC=10
+STRIDE_SEC=10
 
 # yes = reprocess all files; no = skip files whose output CSV already exists
-REWRITE="yes"
+REWRITE="no"
 
-# ── Checkpoint check ──────────────────────────────────────────────────────
+# ── Checkpoint check ──────────────────────────────────────────────────────────
 if [ ! -f "$CKPT" ]; then
     echo "[ERROR] Checkpoint not found: $CKPT"
     echo "        Download it with:"
@@ -42,18 +40,34 @@ if [ ! -f "$CKPT" ]; then
     exit 1
 fi
 
-mkdir -p "$OUT"
-
 REWRITE_FLAG=""
 [ "$REWRITE" = "yes" ] && REWRITE_FLAG="--rewrite"
 
-python infer_h5.py \
-    --h5_dir     "$H5_DIR" \
-    --ckpt       "$CKPT" \
-    --tasks      "$TASKS" \
-    --out        "$OUT" \
-    --batch_size "$BATCH_SIZE" \
-    --leads      "$LEADS" \
-    --window_sec "$WINDOW_SEC" \
-    --stride_sec "$STRIDE_SEC" \
-    $REWRITE_FLAG
+# ── Loop over afib_positive / afib_negative → age_group subdirectories ───────
+for LABEL_DIR in "$DATA_ROOT"/afib_positive "$DATA_ROOT"/afib_negative; do
+    [ -d "$LABEL_DIR" ] || continue
+    LABEL_NAME=$(basename "$LABEL_DIR")   # afib_positive or afib_negative
+
+    for AGE_DIR in "$LABEL_DIR"/*/; do
+        [ -d "$AGE_DIR" ] || continue
+        AGE_NAME=$(basename "$AGE_DIR")   # e.g. 50-60
+
+        H5_DIR="$AGE_DIR"
+        OUT="$OUT_ROOT/$LABEL_NAME/$AGE_NAME"
+        sudo mkdir -p "$OUT"
+
+        echo "── $LABEL_NAME / $AGE_NAME ──────────────────────────────"
+        sudo $(which python) infer_h5.py \
+            --h5_dir     "$H5_DIR" \
+            --ckpt       "$CKPT" \
+            --tasks      "$TASKS" \
+            --out        "$OUT" \
+            --batch_size "$BATCH_SIZE" \
+            --leads      "$LEADS" \
+            --window_sec "$WINDOW_SEC" \
+            --stride_sec "$STRIDE_SEC" \
+            $REWRITE_FLAG
+    done
+done
+
+echo "All done. Results saved to $OUT_ROOT"

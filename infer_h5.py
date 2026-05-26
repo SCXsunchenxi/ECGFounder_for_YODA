@@ -187,7 +187,7 @@ def main():
     for h5_path, group in df.groupby("file", sort=False):
         stem = Path(h5_path).stem
         out_csv = out_dir / f"{stem}.csv"
-        group.to_csv(out_csv, index=False, float_format="%.5f")
+        group.drop(columns=["file"]).to_csv(out_csv, index=False, float_format="%.5f")
         print(f"  Saved {len(group)} rows → {out_csv}")
 
     print(f"Done. {len(df)} total predictions across {df['file'].nunique()} file(s) → {out_dir}/")
