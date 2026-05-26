@@ -145,52 +145,63 @@ def main():
     model.eval()
     print(f"Loaded checkpoint: {args.ckpt}  (in_channels={n_leads})")
 
-    loader = DataLoader(dataset, batch_size=args.batch_size,
-                        shuffle=False, num_workers=min(os.cpu_count(), 8))
-
-    all_probs  = []
-    all_files  = []
-    all_starts = []   # window_start_sec, only filled in xy_mode
-    all_ends   = []   # window_end_sec,   only filled in xy_mode
-
     window_mode = xy_mode or args.window_sec is not None
-    window_len  = args.window_sec if not xy_mode else args.window_sec
+    window_len  = args.window_sec
 
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Inference"):
-            if window_mode:
-                signals, paths, starts = batch
-                all_files.extend(paths)
-                all_starts.extend(starts.numpy().tolist())
-                all_ends.extend((starts + window_len).numpy().tolist())
-            else:
-                signals, paths = batch
-                all_files.extend(paths)
-
-            if args.tile_to_12 and signals.shape[1] == 1:
-                signals = signals.repeat(1, 12, 1)
-
-            signals = signals.to(device)
-            logits  = model(signals)
-            probs   = F.sigmoid(logits).cpu().numpy()
-            all_probs.append(probs)
-
-    all_probs = np.concatenate(all_probs, axis=0)
-
-    df = pd.DataFrame(all_probs, columns=tasks)
-    df.insert(0, "file", all_files)
-    if window_mode:
-        df.insert(1, "window_start_sec", all_starts)
-        df.insert(2, "window_end_sec",   all_ends)
-
-    # Save one CSV per H5 file, named after the H5 stem
-    for h5_path, group in df.groupby("file", sort=False):
-        stem = Path(h5_path).stem
+    total_rows = 0
+    # ── Per-file inference with file-level progress bar ───────────────────────
+    for h5_path in tqdm(all_files, desc="Files"):
+        stem    = Path(h5_path).stem
         out_csv = out_dir / f"{stem}.csv"
-        group.drop(columns=["file"]).to_csv(out_csv, index=False, float_format="%.5f")
-        print(f"  Saved {len(group)} rows → {out_csv}")
 
-    print(f"Done. {len(df)} total predictions across {df['file'].nunique()} file(s) → {out_dir}/")
+        if xy_mode:
+            file_dataset = ECG_XyMatrix_InferenceDataset(
+                h5_files=[h5_path],
+                channel_idx=args.xy_channel_idx,
+                fs=args.xy_fs,
+                window_sec=args.window_sec,
+                stride_sec=args.stride_sec,
+            )
+        else:
+            file_dataset = ECG_H5_InferenceDataset(
+                h5_files=[h5_path],
+                lead_names=args.leads,
+                window_sec=args.window_sec,
+                stride_sec=args.stride_sec,
+            )
+
+        loader = DataLoader(file_dataset, batch_size=args.batch_size,
+                            shuffle=False, num_workers=min(os.cpu_count(), 4))
+
+        probs_list, starts_list, ends_list = [], [], []
+
+        with torch.no_grad():
+            for batch in loader:
+                if window_mode:
+                    signals, _, starts = batch
+                    starts_list.extend(starts.numpy().tolist())
+                    ends_list.extend((starts + window_len).numpy().tolist())
+                else:
+                    signals, _ = batch
+
+                if args.tile_to_12 and signals.shape[1] == 1:
+                    signals = signals.repeat(1, 12, 1)
+
+                logits = model(signals.to(device))
+                probs_list.append(F.sigmoid(logits).cpu().numpy())
+
+        if not probs_list:
+            continue
+
+        df = pd.DataFrame(np.concatenate(probs_list, axis=0), columns=tasks)
+        if window_mode:
+            df.insert(0, "window_start_sec", starts_list)
+            df.insert(1, "window_end_sec",   ends_list)
+
+        df.to_csv(out_csv, index=False, float_format="%.5f")
+        total_rows += len(df)
+
+    print(f"Done. {total_rows} total predictions across {len(all_files)} file(s) → {out_dir}/")
 
 
 if __name__ == "__main__":
